@@ -511,7 +511,7 @@ def build_teacher_model(input_shape, num_classes):
 
 def train_model():
     # Load data
-    train_dataset, test_dataset, train_size, test_size = load_cifar10_3d(INPUT_SHAPE, NUM_CLASSES, BATCH_SIZE)
+    train_dataset, test_dataset, train_size, _ = load_cifar10_3d(INPUT_SHAPE, NUM_CLASSES, BATCH_SIZE)
     
     # Build Teacher Model (Note: Teacher should be pre-trained in a real scenario)
     teacher_model = build_teacher_model(INPUT_SHAPE, NUM_CLASSES)
