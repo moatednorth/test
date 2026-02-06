@@ -1,5 +1,5 @@
 import tensorflow as tf
-from tensorflow.keras import layers, models, callbacks, optimizers
+from tensorflow.keras import layers, models, callbacks, optimizers, regularizers
 import numpy as np
 import os
 
@@ -50,19 +50,34 @@ class PrunableConv3DBlock(layers.Layer):
     3D Conv Block with residual connection and channel pruning components.
     Replaces the attention-based block.
     """
-    def __init__(self, filters, kernel_size, strides=(1, 1, 1), activation='relu', **kwargs):
+    def __init__(self, filters, kernel_size, strides=(1, 1, 1), activation='relu', weight_decay=1e-4, **kwargs):
         super().__init__(**kwargs)
         self.filters = filters
         self.kernel_size = kernel_size
         self.strides = strides
         self.activation = activation
+        self.weight_decay = weight_decay
 
         # Main path layers
-        self.conv1 = layers.Conv3D(filters, kernel_size, strides=strides, padding='same', use_bias=False)
+        self.conv1 = layers.Conv3D(
+            filters,
+            kernel_size,
+            strides=strides,
+            padding='same',
+            use_bias=False,
+            kernel_regularizer=regularizers.l2(weight_decay),
+        )
         self.bn1 = layers.BatchNormalization()
         self.act1 = layers.Activation(activation)
 
-        self.conv2 = layers.Conv3D(filters, kernel_size, strides=(1, 1, 1), padding='same', use_bias=False)
+        self.conv2 = layers.Conv3D(
+            filters,
+            kernel_size,
+            strides=(1, 1, 1),
+            padding='same',
+            use_bias=False,
+            kernel_regularizer=regularizers.l2(weight_decay),
+        )
         self.bn2 = layers.BatchNormalization()
 
         # Pruning components
@@ -85,7 +100,14 @@ class PrunableConv3DBlock(layers.Layer):
 
         # Check for residual connection mismatch
         if input_shape[-1] != self.filters or self.strides != (1, 1, 1):
-            self.residual_conv = layers.Conv3D(self.filters, (1, 1, 1), strides=self.strides, padding='same', use_bias=False)
+            self.residual_conv = layers.Conv3D(
+                self.filters,
+                (1, 1, 1),
+                strides=self.strides,
+                padding='same',
+                use_bias=False,
+                kernel_regularizer=regularizers.l2(self.weight_decay),
+            )
             self.residual_bn = layers.BatchNormalization()
 
         super().build(input_shape)
@@ -131,6 +153,7 @@ class PrunableConv3DBlock(layers.Layer):
             'kernel_size': self.kernel_size,
             'strides': self.strides,
             'activation': self.activation,
+            'weight_decay': self.weight_decay,
         })
         return config
 
@@ -247,10 +270,12 @@ class WarmupCosineDecay(optimizers.schedules.LearningRateSchedule):
         initial_learning_rate = tf.cast(self.initial_learning_rate, tf.float32)
 
         # Warmup phase calculation
-        warmup_lr = initial_learning_rate * (step / warmup_steps)
+        safe_warmup_steps = tf.maximum(warmup_steps, 1.0)
+        warmup_lr = initial_learning_rate * (step / safe_warmup_steps)
 
         # Cosine decay phase calculation
-        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        decay_steps = tf.maximum(total_steps - warmup_steps, 1.0)
+        progress = (step - warmup_steps) / decay_steps
         progress = tf.clip_by_value(progress, 0.0, 1.0)
         cosine_decay = 0.5 * (1.0 + tf.cos(tf.constant(np.pi, dtype=tf.float32) * progress))
         cosine_lr = initial_learning_rate * cosine_decay
@@ -265,34 +290,79 @@ class WarmupCosineDecay(optimizers.schedules.LearningRateSchedule):
             "warmup_steps": self.warmup_steps,
         }
 
-def build_model(input_shape, num_classes, initial_filters=16):
+def build_model(input_shape, num_classes, initial_filters=16, weight_decay=1e-4, dropout_rate=0.3):
     """Builds the 3D CNN model using PrunableConv3DBlock and multi-scale fusion."""
     inputs = layers.Input(shape=input_shape)
     x = inputs
 
     # Initial Conv3D
-    x = layers.Conv3D(initial_filters, (3, 3, 3), padding='same', use_bias=False)(x)
+    x = layers.Conv3D(
+        initial_filters,
+        (3, 3, 3),
+        padding='same',
+        use_bias=False,
+        kernel_regularizer=regularizers.l2(weight_decay),
+    )(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('relu')(x)
 
     # --- Multi-Scale Fusion Blocks ---
     # Scale 1: Small kernel size (3x3x3)
-    x = PrunableConv3DBlock(initial_filters * 2, (3, 3, 3), strides=(2, 2, 2), name='block1_1')(x)
-    x = PrunableConv3DBlock(initial_filters * 2, (3, 3, 3), name='block1_2')(x)
+    x = PrunableConv3DBlock(
+        initial_filters * 2,
+        (3, 3, 3),
+        strides=(2, 2, 2),
+        weight_decay=weight_decay,
+        name='block1_1',
+    )(x)
+    x = PrunableConv3DBlock(
+        initial_filters * 2,
+        (3, 3, 3),
+        weight_decay=weight_decay,
+        name='block1_2',
+    )(x)
 
     # Scale 2: Medium kernel size (5x5x5)
-    x = PrunableConv3DBlock(initial_filters * 4, (5, 5, 5), strides=(2, 2, 2), name='block2_1')(x)
-    x = PrunableConv3DBlock(initial_filters * 4, (5, 5, 5), name='block2_2')(x)
+    x = PrunableConv3DBlock(
+        initial_filters * 4,
+        (5, 5, 5),
+        strides=(2, 2, 2),
+        weight_decay=weight_decay,
+        name='block2_1',
+    )(x)
+    x = PrunableConv3DBlock(
+        initial_filters * 4,
+        (5, 5, 5),
+        weight_decay=weight_decay,
+        name='block2_2',
+    )(x)
 
     # Scale 3: Large kernel size (7x7x7)
-    x = PrunableConv3DBlock(initial_filters * 8, (7, 7, 7), strides=(2, 2, 2), name='block3_1')(x)
-    final_block_output = PrunableConv3DBlock(initial_filters * 8, (7, 7, 7), name='block3_2')(x)
+    x = PrunableConv3DBlock(
+        initial_filters * 8,
+        (7, 7, 7),
+        strides=(2, 2, 2),
+        weight_decay=weight_decay,
+        name='block3_1',
+    )(x)
+    final_block_output = PrunableConv3DBlock(
+        initial_filters * 8,
+        (7, 7, 7),
+        weight_decay=weight_decay,
+        name='block3_2',
+    )(x)
 
     # --- Feature Aggregation and Classifier ---
     aggregated_features = layers.GlobalAveragePooling3D()(final_block_output)
+    aggregated_features = layers.Dropout(dropout_rate)(aggregated_features)
 
     # Classifier head
-    classifier = layers.Dense(num_classes, activation='softmax', name='classifier')(aggregated_features)
+    classifier = layers.Dense(
+        num_classes,
+        activation='softmax',
+        kernel_regularizer=regularizers.l2(weight_decay),
+        name='classifier',
+    )(aggregated_features)
 
     model = models.Model(inputs=inputs, outputs=classifier, name='prunable_3d_cnn')
     return model
@@ -311,7 +381,10 @@ class KDTrainingModel(models.Model):
 
     def compile(self, optimizer, metrics=None, **kwargs):
         super().compile(optimizer=optimizer, metrics=metrics, **kwargs)
-        self.student_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+        self.student_loss_fn = tf.keras.losses.CategoricalCrossentropy(
+            from_logits=False,
+            label_smoothing=0.1,
+        )
         self.distillation_loss_fn = tf.keras.losses.KLDivergence()
 
     @tf.function
@@ -387,17 +460,37 @@ def load_cifar10_3d(input_shape, num_classes, batch_size):
 
     # Simulate 3D data by repeating the 2D image along a new dimension (D)
     D = input_shape[0]
-    x_train_3d = np.repeat(x_train_2d[:, np.newaxis, :, :, :], D, axis=1)
-    x_test_3d = np.repeat(x_test_2d[:, np.newaxis, :, :, :], D, axis=1)
+
+    def augment_2d(image):
+        image = tf.image.random_flip_left_right(image)
+        image = tf.image.resize_with_crop_or_pad(image, 36, 36)
+        image = tf.image.random_crop(image, size=(32, 32, 3))
+        return image
+
+    def to_3d(image, label):
+        image_3d = tf.repeat(tf.expand_dims(image, axis=0), D, axis=0)
+        return image_3d, label
 
     print(f"Original 2D shape: {x_train_2d.shape}")
-    print(f"Simulated 3D shape: {x_train_3d.shape}")
+    print(f"Simulated 3D depth: {D}")
 
     # Create tf.data.Dataset objects
-    train_dataset = tf.data.Dataset.from_tensor_slices((x_train_3d, y_train)).shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    test_dataset = tf.data.Dataset.from_tensor_slices((x_test_3d, y_test)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    train_dataset = (
+        tf.data.Dataset.from_tensor_slices((x_train_2d, y_train))
+        .shuffle(buffer_size=1024)
+        .map(lambda image, label: (augment_2d(image), label), num_parallel_calls=tf.data.AUTOTUNE)
+        .map(to_3d, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+    test_dataset = (
+        tf.data.Dataset.from_tensor_slices((x_test_2d, y_test))
+        .map(to_3d, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
 
-    return train_dataset, test_dataset, len(x_train_3d), len(x_test_3d)
+    return train_dataset, test_dataset, len(x_train_2d), len(x_test_2d)
 
 def build_teacher_model(input_shape, num_classes):
     """A simple, unpruned 3D CNN for knowledge distillation."""
@@ -413,7 +506,7 @@ def build_teacher_model(input_shape, num_classes):
 
 def train_model():
     # Load data
-    train_dataset, test_dataset, train_size, test_size = load_cifar10_3d(INPUT_SHAPE, NUM_CLASSES, BATCH_SIZE)
+    train_dataset, test_dataset, train_size, _ = load_cifar10_3d(INPUT_SHAPE, NUM_CLASSES, BATCH_SIZE)
     
     # Build Teacher Model (Note: Teacher should be pre-trained in a real scenario)
     teacher_model = build_teacher_model(INPUT_SHAPE, NUM_CLASSES)
@@ -424,6 +517,7 @@ def train_model():
     # Setup Learning Rate Schedule and Optimizer
     total_steps = int(np.ceil(train_size / BATCH_SIZE) * EPOCHS)
     warmup_steps = int(np.ceil(train_size / BATCH_SIZE) * WARMUP_EPOCHS)
+    warmup_steps = min(warmup_steps, total_steps)
     
     lr_schedule = WarmupCosineDecay(
         initial_learning_rate=INITIAL_LR,
