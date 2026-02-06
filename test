@@ -433,7 +433,7 @@ class KDTrainingModel(models.Model):
         # Only evaluate the student model
         x, y = data
         student_predictions = self.student(x, training=False)
-        student_loss = self.student_loss_fn(y, student_predictions)
+        student_loss = self.eval_loss_fn(y, student_predictions)
         
         self.compiled_metrics.update_state(y, student_predictions)
         results = {m.name: m.result() for m in self.metrics}
