@@ -16,6 +16,9 @@ PRUNING_SCHEDULE = {
 }
 INITIAL_LR = 1e-3
 WARMUP_EPOCHS = 5
+WEIGHT_DECAY = 1e-4
+DROPOUT_RATE = 0.3
+LABEL_SMOOTHING = 0.1
 
 # --- Pruning Utility Layer ---
 
@@ -56,13 +59,28 @@ class PrunableConv3DBlock(layers.Layer):
         self.kernel_size = kernel_size
         self.strides = strides
         self.activation = activation
+        self.kernel_regularizer = tf.keras.regularizers.l2(WEIGHT_DECAY)
 
         # Main path layers
-        self.conv1 = layers.Conv3D(filters, kernel_size, strides=strides, padding='same', use_bias=False)
+        self.conv1 = layers.Conv3D(
+            filters,
+            kernel_size,
+            strides=strides,
+            padding='same',
+            use_bias=False,
+            kernel_regularizer=self.kernel_regularizer,
+        )
         self.bn1 = layers.BatchNormalization()
         self.act1 = layers.Activation(activation)
 
-        self.conv2 = layers.Conv3D(filters, kernel_size, strides=(1, 1, 1), padding='same', use_bias=False)
+        self.conv2 = layers.Conv3D(
+            filters,
+            kernel_size,
+            strides=(1, 1, 1),
+            padding='same',
+            use_bias=False,
+            kernel_regularizer=self.kernel_regularizer,
+        )
         self.bn2 = layers.BatchNormalization()
 
         # Pruning components
@@ -85,7 +103,14 @@ class PrunableConv3DBlock(layers.Layer):
 
         # Check for residual connection mismatch
         if input_shape[-1] != self.filters or self.strides != (1, 1, 1):
-            self.residual_conv = layers.Conv3D(self.filters, (1, 1, 1), strides=self.strides, padding='same', use_bias=False)
+            self.residual_conv = layers.Conv3D(
+                self.filters,
+                (1, 1, 1),
+                strides=self.strides,
+                padding='same',
+                use_bias=False,
+                kernel_regularizer=self.kernel_regularizer,
+            )
             self.residual_bn = layers.BatchNormalization()
 
         super().build(input_shape)
@@ -131,6 +156,7 @@ class PrunableConv3DBlock(layers.Layer):
             'kernel_size': self.kernel_size,
             'strides': self.strides,
             'activation': self.activation,
+            'weight_decay': WEIGHT_DECAY,
         })
         return config
 
@@ -247,10 +273,12 @@ class WarmupCosineDecay(optimizers.schedules.LearningRateSchedule):
         initial_learning_rate = tf.cast(self.initial_learning_rate, tf.float32)
 
         # Warmup phase calculation
-        warmup_lr = initial_learning_rate * (step / warmup_steps)
+        safe_warmup_steps = tf.maximum(warmup_steps, 1.0)
+        warmup_lr = initial_learning_rate * (step / safe_warmup_steps)
 
         # Cosine decay phase calculation
-        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        decay_steps = tf.maximum(total_steps - warmup_steps, 1.0)
+        progress = (step - warmup_steps) / decay_steps
         progress = tf.clip_by_value(progress, 0.0, 1.0)
         cosine_decay = 0.5 * (1.0 + tf.cos(tf.constant(np.pi, dtype=tf.float32) * progress))
         cosine_lr = initial_learning_rate * cosine_decay
@@ -267,11 +295,18 @@ class WarmupCosineDecay(optimizers.schedules.LearningRateSchedule):
 
 def build_model(input_shape, num_classes, initial_filters=16):
     """Builds the 3D CNN model using PrunableConv3DBlock and multi-scale fusion."""
+    kernel_regularizer = tf.keras.regularizers.l2(WEIGHT_DECAY)
     inputs = layers.Input(shape=input_shape)
     x = inputs
 
     # Initial Conv3D
-    x = layers.Conv3D(initial_filters, (3, 3, 3), padding='same', use_bias=False)(x)
+    x = layers.Conv3D(
+        initial_filters,
+        (3, 3, 3),
+        padding='same',
+        use_bias=False,
+        kernel_regularizer=kernel_regularizer,
+    )(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('relu')(x)
 
@@ -290,9 +325,15 @@ def build_model(input_shape, num_classes, initial_filters=16):
 
     # --- Feature Aggregation and Classifier ---
     aggregated_features = layers.GlobalAveragePooling3D()(final_block_output)
+    aggregated_features = layers.Dropout(DROPOUT_RATE)(aggregated_features)
 
     # Classifier head
-    classifier = layers.Dense(num_classes, activation='softmax', name='classifier')(aggregated_features)
+    classifier = layers.Dense(
+        num_classes,
+        activation='softmax',
+        kernel_regularizer=kernel_regularizer,
+        name='classifier',
+    )(aggregated_features)
 
     model = models.Model(inputs=inputs, outputs=classifier, name='prunable_3d_cnn')
     return model
@@ -311,7 +352,10 @@ class KDTrainingModel(models.Model):
 
     def compile(self, optimizer, metrics=None, **kwargs):
         super().compile(optimizer=optimizer, metrics=metrics, **kwargs)
-        self.student_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+        self.student_loss_fn = tf.keras.losses.CategoricalCrossentropy(
+            from_logits=False,
+            label_smoothing=LABEL_SMOOTHING,
+        )
         self.distillation_loss_fn = tf.keras.losses.KLDivergence()
 
     @tf.function
@@ -385,30 +429,71 @@ def load_cifar10_3d(input_shape, num_classes, batch_size):
     y_train = tf.keras.utils.to_categorical(y_train, num_classes)
     y_test = tf.keras.utils.to_categorical(y_test, num_classes)
 
-    # Simulate 3D data by repeating the 2D image along a new dimension (D)
-    D = input_shape[0]
-    x_train_3d = np.repeat(x_train_2d[:, np.newaxis, :, :, :], D, axis=1)
-    x_test_3d = np.repeat(x_test_2d[:, np.newaxis, :, :, :], D, axis=1)
+    def augment_2d(image, label):
+        image = tf.image.resize_with_crop_or_pad(image, 40, 40)
+        image = tf.image.random_crop(image, size=(32, 32, 3))
+        image = tf.image.random_flip_left_right(image)
+        return image, label
+
+    def to_3d(image, label):
+        depth = input_shape[0]
+        image = tf.repeat(tf.expand_dims(image, axis=0), depth, axis=0)
+        return image, label
 
     print(f"Original 2D shape: {x_train_2d.shape}")
-    print(f"Simulated 3D shape: {x_train_3d.shape}")
+    print(f"Simulated 3D shape: ({x_train_2d.shape[0]}, {input_shape[0]}, 32, 32, 3)")
 
-    # Create tf.data.Dataset objects
-    train_dataset = tf.data.Dataset.from_tensor_slices((x_train_3d, y_train)).shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    test_dataset = tf.data.Dataset.from_tensor_slices((x_test_3d, y_test)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    train_dataset = (
+        tf.data.Dataset.from_tensor_slices((x_train_2d, y_train))
+        .shuffle(buffer_size=1024)
+        .map(augment_2d, num_parallel_calls=tf.data.AUTOTUNE)
+        .map(to_3d, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+    test_dataset = (
+        tf.data.Dataset.from_tensor_slices((x_test_2d, y_test))
+        .map(to_3d, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
 
-    return train_dataset, test_dataset, len(x_train_3d), len(x_test_3d)
+    return train_dataset, test_dataset, len(x_train_2d), len(x_test_2d)
 
 def build_teacher_model(input_shape, num_classes):
     """A simple, unpruned 3D CNN for knowledge distillation."""
+    kernel_regularizer = tf.keras.regularizers.l2(WEIGHT_DECAY)
     inputs = layers.Input(shape=input_shape)
-    x = layers.Conv3D(64, (3, 3, 3), padding='same', activation='relu')(inputs)
+    x = layers.Conv3D(
+        64,
+        (3, 3, 3),
+        padding='same',
+        activation='relu',
+        kernel_regularizer=kernel_regularizer,
+    )(inputs)
     x = layers.MaxPool3D((2, 2, 2))(x)
-    x = layers.Conv3D(128, (3, 3, 3), padding='same', activation='relu')(x)
+    x = layers.Conv3D(
+        128,
+        (3, 3, 3),
+        padding='same',
+        activation='relu',
+        kernel_regularizer=kernel_regularizer,
+    )(x)
     x = layers.MaxPool3D((2, 2, 2))(x)
-    x = layers.Conv3D(256, (3, 3, 3), padding='same', activation='relu')(x)
+    x = layers.Conv3D(
+        256,
+        (3, 3, 3),
+        padding='same',
+        activation='relu',
+        kernel_regularizer=kernel_regularizer,
+    )(x)
     x = layers.GlobalAveragePooling3D()(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    x = layers.Dropout(DROPOUT_RATE)(x)
+    outputs = layers.Dense(
+        num_classes,
+        activation='softmax',
+        kernel_regularizer=kernel_regularizer,
+    )(x)
     return models.Model(inputs, outputs, name='teacher_model')
 
 def train_model():
@@ -424,13 +509,14 @@ def train_model():
     # Setup Learning Rate Schedule and Optimizer
     total_steps = int(np.ceil(train_size / BATCH_SIZE) * EPOCHS)
     warmup_steps = int(np.ceil(train_size / BATCH_SIZE) * WARMUP_EPOCHS)
+    warmup_steps = min(warmup_steps, total_steps)
     
     lr_schedule = WarmupCosineDecay(
         initial_learning_rate=INITIAL_LR,
         total_steps=total_steps,
         warmup_steps=warmup_steps
     )
-    optimizer = optimizers.Adam(learning_rate=lr_schedule)
+    optimizer = optimizers.AdamW(learning_rate=lr_schedule, weight_decay=WEIGHT_DECAY)
 
     # Instantiate KDTrainingModel
     kd_model = KDTrainingModel(student_model, teacher_model)
