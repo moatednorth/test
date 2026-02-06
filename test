@@ -1,0 +1,485 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, optimizers
+import numpy as np
+import os
+
+# --- Configuration and Hyperparameters ---
+NUM_CLASSES = 10
+INPUT_SHAPE = (8, 32, 32, 3) # Reduced depth for memory: 8x32x32 volume with 3 channels
+BATCH_SIZE = 64
+EPOCHS = 10
+PRUNING_SCHEDULE = {
+    "start_epoch": 2,
+    "end_epoch": 8,
+    "target_sparsity": 0.5, # 50% of perceptrons to be pruned
+    "frequency": 1 # Prune every epoch
+}
+INITIAL_LR = 1e-3
+WARMUP_EPOCHS = 5
+
+# --- Pruning Utility Layer ---
+
+class PruningMask(layers.Layer):
+    """Applies a binary mask to its input for channel pruning."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.mask = None
+
+    def build(self, input_shape):
+        mask_shape = (input_shape[-1],)
+        self.mask = self.add_weight(
+            name='pruning_mask',
+            shape=mask_shape,
+            initializer=tf.keras.initializers.Ones(),
+            trainable=False,
+            dtype=self.dtype
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # Mask is broadcasted across all spatial and batch dimensions.
+        return inputs * self.mask
+
+    def get_config(self):
+        return super().get_config()
+
+# --- PrunableConv3DBlock Implementation ---
+
+class PrunableConv3DBlock(layers.Layer):
+    """
+    3D Conv Block with residual connection and channel pruning components.
+    Replaces the attention-based block.
+    """
+    def __init__(self, filters, kernel_size, strides=(1, 1, 1), activation='relu', **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.strides = strides
+        self.activation = activation
+
+        # Main path layers
+        self.conv1 = layers.Conv3D(filters, kernel_size, strides=strides, padding='same', use_bias=False)
+        self.bn1 = layers.BatchNormalization()
+        self.act1 = layers.Activation(activation)
+
+        self.conv2 = layers.Conv3D(filters, kernel_size, strides=(1, 1, 1), padding='same', use_bias=False)
+        self.bn2 = layers.BatchNormalization()
+
+        # Pruning components
+        self.pruning_mask = PruningMask()
+        self.activation_tracker = None
+
+        # Residual connection layers (initialized in build if needed)
+        self.residual_conv = None
+        self.residual_bn = None
+
+    def build(self, input_shape):
+        score_shape = (self.filters,)
+        self.activation_tracker = self.add_weight(
+            name='activation_tracker',
+            shape=score_shape,
+            initializer=tf.keras.initializers.Zeros(),
+            trainable=False,
+            dtype=self.dtype
+        )
+
+        # Check for residual connection mismatch
+        if input_shape[-1] != self.filters or self.strides != (1, 1, 1):
+            self.residual_conv = layers.Conv3D(self.filters, (1, 1, 1), strides=self.strides, padding='same', use_bias=False)
+            self.residual_bn = layers.BatchNormalization()
+
+        super().build(input_shape)
+
+    def call(self, inputs, training=False):
+        shortcut = inputs
+
+        # Main path
+        x = self.conv1(inputs)
+        x = self.bn1(x, training=training)
+        x = self.act1(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x, training=training)
+
+        # Residual connection
+        if self.residual_conv is not None:
+            shortcut = self.residual_conv(shortcut)
+            shortcut = self.residual_bn(shortcut, training=training)
+
+        # Add residual
+        x = layers.add([x, shortcut])
+        
+        # Apply Pruning Mask AFTER residual addition for correct channel pruning
+        x = self.pruning_mask(x)
+
+        # Apply final activation
+        output = layers.Activation(self.activation)(x)
+
+        # Activation Tracking (only during training)
+        if training:
+            # Calculate L1 norm of the output channels (perceptrons)
+            l1_norm = tf.reduce_sum(tf.abs(output), axis=[0, 1, 2, 3])
+            # Accumulate L1 norm for the current batch
+            self.activation_tracker.assign_add(l1_norm)
+
+        return output
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'filters': self.filters,
+            'kernel_size': self.kernel_size,
+            'strides': self.strides,
+            'activation': self.activation,
+        })
+        return config
+
+# --- PruningCallback Implementation ---
+
+class PruningCallback(callbacks.Callback):
+    """Handles the iterative pruning process based on a schedule."""
+    def __init__(self, schedule, **kwargs):
+        super().__init__(**kwargs)
+        self.schedule = schedule
+        self.target_sparsity = schedule['target_sparsity']
+        self.start_epoch = schedule['start_epoch']
+        self.end_epoch = schedule['end_epoch']
+        self.frequency = schedule['frequency']
+        self.prunable_blocks = []
+        self.total_perceptrons = 0
+
+    def on_train_begin(self, logs=None):
+        # Identify all PrunableConv3DBlock instances
+        for layer in self.model.layers:
+            if isinstance(layer, PrunableConv3DBlock):
+                self.prunable_blocks.append(layer)
+
+        self.total_perceptrons = sum(block.filters for block in self.prunable_blocks)
+        print(f"Total prunable perceptrons: {self.total_perceptrons}")
+
+    def on_epoch_begin(self, epoch, logs=None):
+        # Reset activation trackers at the start of a pruning cycle
+        if epoch >= self.start_epoch and epoch <= self.end_epoch and (epoch - self.start_epoch) % self.frequency == 0:
+            for block in self.prunable_blocks:
+                block.activation_tracker.assign(tf.zeros_like(block.activation_tracker))
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch >= self.start_epoch and epoch <= self.end_epoch and (epoch - self.start_epoch) % self.frequency == 0:
+            print(f"\n--- Pruning at epoch {epoch} ---")
+            self.prune_model(epoch)
+
+    def prune_model(self, current_epoch):
+        # 1. Calculate current target sparsity based on linear schedule
+        schedule_range = self.end_epoch - self.start_epoch
+        current_step = current_epoch - self.start_epoch
+        current_sparsity = self.target_sparsity * (current_step / schedule_range) if schedule_range > 0 else self.target_sparsity
+
+        # 2. Calculate target number of pruned perceptrons
+        target_pruned_count = int(self.total_perceptrons * current_sparsity)
+
+        # 3. Collect all importance scores (L1 norm of activations)
+        all_scores = []
+        current_active_count = 0
+        for block in self.prunable_blocks:
+            scores = block.activation_tracker.numpy()
+            mask = block.pruning_mask.mask.numpy()
+            active_scores = scores[mask == 1]
+            all_scores.extend(active_scores)
+            current_active_count += len(active_scores)
+
+        if not all_scores:
+            print("No active perceptrons to prune.")
+            return
+
+        current_pruned_count = self.total_perceptrons - current_active_count
+        num_to_prune_additional = target_pruned_count - current_pruned_count
+        
+        if num_to_prune_additional <= 0:
+            print(f"Current sparsity ({current_pruned_count}/{self.total_perceptrons}) already meets or exceeds target sparsity ({target_pruned_count}/{self.total_perceptrons}). Skipping pruning.")
+            return
+
+        print(f"Current active perceptrons: {current_active_count}")
+        print(f"Target pruned perceptrons: {target_pruned_count}")
+        print(f"Additional perceptrons to prune: {num_to_prune_additional}")
+
+        # 4. Determine the global pruning threshold
+        sorted_scores = np.sort(all_scores)
+        if num_to_prune_additional >= len(sorted_scores):
+            threshold = sorted_scores[-1] + 1
+        else:
+            threshold = sorted_scores[num_to_prune_additional - 1]
+
+        # 5. Apply the mask to individual blocks
+        total_pruned_in_step = 0
+        for block in self.prunable_blocks:
+            scores = block.activation_tracker.numpy()
+            mask = block.pruning_mask.mask.numpy()
+            
+            # Identify perceptrons to prune: currently active AND score <= threshold
+            prune_indices = np.where((mask == 1) & (scores <= threshold))[0]
+            
+            # Update the mask
+            new_mask = mask.copy()
+            new_mask[prune_indices] = 0
+            
+            block.pruning_mask.mask.assign(new_mask)
+            total_pruned_in_step += len(prune_indices)
+
+        final_active_count = self.total_perceptrons - (current_pruned_count + total_pruned_in_step)
+        final_sparsity = (self.total_perceptrons - final_active_count) / self.total_perceptrons
+        print(f"Pruned {total_pruned_in_step} perceptrons. Final active count: {final_active_count}/{self.total_perceptrons} (Sparsity: {final_sparsity:.4f})")
+
+
+# --- Model Architecture and Components ---
+
+class WarmupCosineDecay(optimizers.schedules.LearningRateSchedule):
+    """Learning rate schedule with warmup followed by cosine decay."""
+    def __init__(self, initial_learning_rate, total_steps, warmup_steps, **kwargs):
+        super().__init__(**kwargs)
+        self.initial_learning_rate = initial_learning_rate
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup_steps = tf.cast(self.warmup_steps, tf.float32)
+        total_steps = tf.cast(self.total_steps, tf.float32)
+        initial_learning_rate = tf.cast(self.initial_learning_rate, tf.float32)
+
+        # Warmup phase calculation
+        warmup_lr = initial_learning_rate * (step / warmup_steps)
+
+        # Cosine decay phase calculation
+        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        progress = tf.clip_by_value(progress, 0.0, 1.0)
+        cosine_decay = 0.5 * (1.0 + tf.cos(tf.constant(np.pi, dtype=tf.float32) * progress))
+        cosine_lr = initial_learning_rate * cosine_decay
+
+        # Use tf.where to select the correct LR based on the step
+        return tf.where(step < warmup_steps, warmup_lr, cosine_lr)
+
+    def get_config(self):
+        return {
+            "initial_learning_rate": self.initial_learning_rate,
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+        }
+
+def build_model(input_shape, num_classes, initial_filters=16):
+    """Builds the 3D CNN model using PrunableConv3DBlock and multi-scale fusion."""
+    inputs = layers.Input(shape=input_shape)
+    x = inputs
+
+    # Initial Conv3D
+    x = layers.Conv3D(initial_filters, (3, 3, 3), padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+
+    # --- Multi-Scale Fusion Blocks ---
+    # Scale 1: Small kernel size (3x3x3)
+    x = PrunableConv3DBlock(initial_filters * 2, (3, 3, 3), strides=(2, 2, 2), name='block1_1')(x)
+    x = PrunableConv3DBlock(initial_filters * 2, (3, 3, 3), name='block1_2')(x)
+
+    # Scale 2: Medium kernel size (5x5x5)
+    x = PrunableConv3DBlock(initial_filters * 4, (5, 5, 5), strides=(2, 2, 2), name='block2_1')(x)
+    x = PrunableConv3DBlock(initial_filters * 4, (5, 5, 5), name='block2_2')(x)
+
+    # Scale 3: Large kernel size (7x7x7)
+    x = PrunableConv3DBlock(initial_filters * 8, (7, 7, 7), strides=(2, 2, 2), name='block3_1')(x)
+    final_block_output = PrunableConv3DBlock(initial_filters * 8, (7, 7, 7), name='block3_2')(x)
+
+    # --- Feature Aggregation and Classifier ---
+    aggregated_features = layers.GlobalAveragePooling3D()(final_block_output)
+
+    # Classifier head
+    classifier = layers.Dense(num_classes, activation='softmax', name='classifier')(aggregated_features)
+
+    model = models.Model(inputs=inputs, outputs=classifier, name='prunable_3d_cnn')
+    return model
+
+# --- Knowledge Distillation Model (KDTrainingModel) ---
+
+class KDTrainingModel(models.Model):
+    """Model wrapper for Knowledge Distillation training."""
+    def __init__(self, student_model, teacher_model, temperature=3.0, alpha=0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.student = student_model
+        self.teacher = teacher_model
+        self.temperature = temperature
+        self.alpha = alpha
+        self.teacher.trainable = False
+
+    def compile(self, optimizer, metrics=None, **kwargs):
+        super().compile(optimizer=optimizer, metrics=metrics, **kwargs)
+        self.student_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+        self.distillation_loss_fn = tf.keras.losses.KLDivergence()
+
+    @tf.function
+    def train_step(self, data):
+        x, y = data
+
+        with tf.GradientTape() as tape:
+            student_predictions = self.student(x, training=True)
+            teacher_predictions = self.teacher(x, training=False)
+            
+            # 1. Hard loss (Student vs True labels)
+            student_loss = self.student_loss_fn(y, student_predictions)
+
+            # 2. Distillation loss (Student vs Teacher soft targets)
+            # Use log-probabilities for KLD
+            teacher_log_probs = tf.math.log(teacher_predictions + 1e-7) / self.temperature
+            student_log_probs = tf.math.log(student_predictions + 1e-7) / self.temperature
+            
+            teacher_soft_probs = tf.nn.softmax(teacher_log_probs)
+            student_soft_probs = tf.nn.softmax(student_log_probs)
+            
+            distillation_loss = self.distillation_loss_fn(teacher_soft_probs, student_soft_probs)
+            
+            # Scale distillation loss by T^2
+            distillation_loss = distillation_loss * (self.temperature ** 2)
+
+            # Total loss
+            total_loss = (self.alpha * student_loss) + ((1 - self.alpha) * distillation_loss)
+
+        # Compute gradients and update weights
+        trainable_vars = self.student.trainable_variables
+        gradients = tape.gradient(total_loss, trainable_vars)
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+
+        # Update metrics
+        self.compiled_metrics.update_state(y, student_predictions)
+        
+        results = {m.name: m.result() for m in self.metrics}
+        results.update({'student_loss': student_loss, 'distillation_loss': distillation_loss, 'total_loss': total_loss})
+        return results
+
+    def test_step(self, data):
+        # Only evaluate the student model
+        x, y = data
+        student_predictions = self.student(x, training=False)
+        student_loss = self.student_loss_fn(y, student_predictions)
+        
+        self.compiled_metrics.update_state(y, student_predictions)
+        results = {m.name: m.result() for m in self.metrics}
+        results.update({'loss': student_loss})
+        return results
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "temperature": self.temperature,
+            "alpha": self.alpha,
+        })
+        return config
+
+# --- Main Execution Logic ---
+
+def load_cifar10_3d(input_shape, num_classes, batch_size):
+    """Simulates 3D CIFAR-10 data and returns tf.data.Dataset objects."""
+    print("Loading and preparing simulated 3D CIFAR-10 data...")
+    (x_train_2d, y_train), (x_test_2d, y_test) = tf.keras.datasets.cifar10.load_data()
+
+    # Normalize and one-hot encode
+    x_train_2d = x_train_2d.astype('float32') / 255.0
+    x_test_2d = x_test_2d.astype('float32') / 255.0
+    y_train = tf.keras.utils.to_categorical(y_train, num_classes)
+    y_test = tf.keras.utils.to_categorical(y_test, num_classes)
+
+    # Simulate 3D data by repeating the 2D image along a new dimension (D)
+    D = input_shape[0]
+    x_train_3d = np.repeat(x_train_2d[:, np.newaxis, :, :, :], D, axis=1)
+    x_test_3d = np.repeat(x_test_2d[:, np.newaxis, :, :, :], D, axis=1)
+
+    print(f"Original 2D shape: {x_train_2d.shape}")
+    print(f"Simulated 3D shape: {x_train_3d.shape}")
+
+    # Create tf.data.Dataset objects
+    train_dataset = tf.data.Dataset.from_tensor_slices((x_train_3d, y_train)).shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    test_dataset = tf.data.Dataset.from_tensor_slices((x_test_3d, y_test)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return train_dataset, test_dataset, len(x_train_3d), len(x_test_3d)
+
+def build_teacher_model(input_shape, num_classes):
+    """A simple, unpruned 3D CNN for knowledge distillation."""
+    inputs = layers.Input(shape=input_shape)
+    x = layers.Conv3D(64, (3, 3, 3), padding='same', activation='relu')(inputs)
+    x = layers.MaxPool3D((2, 2, 2))(x)
+    x = layers.Conv3D(128, (3, 3, 3), padding='same', activation='relu')(x)
+    x = layers.MaxPool3D((2, 2, 2))(x)
+    x = layers.Conv3D(256, (3, 3, 3), padding='same', activation='relu')(x)
+    x = layers.GlobalAveragePooling3D()(x)
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    return models.Model(inputs, outputs, name='teacher_model')
+
+def train_model():
+    # Load data
+    train_dataset, test_dataset, train_size, test_size = load_cifar10_3d(INPUT_SHAPE, NUM_CLASSES, BATCH_SIZE)
+    
+    # Build Teacher Model (Note: Teacher should be pre-trained in a real scenario)
+    teacher_model = build_teacher_model(INPUT_SHAPE, NUM_CLASSES)
+    
+    # Build Student Model (The prunable 3D CNN)
+    student_model = build_model(INPUT_SHAPE, NUM_CLASSES, initial_filters=16)
+    
+    # Setup Learning Rate Schedule and Optimizer
+    total_steps = int(np.ceil(train_size / BATCH_SIZE) * EPOCHS)
+    warmup_steps = int(np.ceil(train_size / BATCH_SIZE) * WARMUP_EPOCHS)
+    
+    lr_schedule = WarmupCosineDecay(
+        initial_learning_rate=INITIAL_LR,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps
+    )
+    optimizer = optimizers.Adam(learning_rate=lr_schedule)
+
+    # Instantiate KDTrainingModel
+    kd_model = KDTrainingModel(student_model, teacher_model)
+    
+    kd_model.compile(
+        optimizer=optimizer,
+        metrics=['accuracy']
+    )
+
+    # Instantiate Pruning Callback
+    pruning_callback = PruningCallback(schedule=PRUNING_SCHEDULE)
+
+    # Train the Model
+    print("\n--- Starting Training with Pruning and Knowledge Distillation ---")
+    kd_model.fit(
+        train_dataset, 
+        epochs=EPOCHS, 
+        validation_data=test_dataset,
+        callbacks=[pruning_callback]
+    )
+
+    print("\n--- Training Complete ---")
+    
+    # Final Student Model Evaluation
+    # Compile the student model for standalone evaluation
+    student_model.compile(
+        optimizer=optimizer, # Optimizer doesn't matter for evaluation, but Keras requires it
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    loss, acc = student_model.evaluate(test_dataset, verbose=0)
+    print(f"\nFinal Test Accuracy: {acc:.4f}")
+    
+    # Check final sparsity
+    total_active = 0
+    total_params = 0
+    for layer in student_model.layers:
+        if isinstance(layer, PrunableConv3DBlock):
+            mask = layer.pruning_mask.mask.numpy()
+            total_active += np.sum(mask)
+            total_params += len(mask)
+    
+    final_sparsity = 1.0 - (total_active / total_params) if total_params > 0 else 0
+    print(f"Final Model Sparsity: {final_sparsity:.4f} ({int(total_active)}/{total_params} active perceptrons)")
+
+if __name__ == '__main__':
+    tf.random.set_seed(42)
+    np.random.seed(42)
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+    
+    train_model()
