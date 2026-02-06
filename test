@@ -16,6 +16,9 @@ PRUNING_SCHEDULE = {
 }
 INITIAL_LR = 1e-3
 WARMUP_EPOCHS = 5
+WEIGHT_DECAY = 1e-4
+DROPOUT_RATE = 0.3
+LABEL_SMOOTHING = 0.1
 
 # --- Pruning Utility Layer ---
 
@@ -383,7 +386,7 @@ class KDTrainingModel(models.Model):
         super().compile(optimizer=optimizer, metrics=metrics, **kwargs)
         self.student_loss_fn = tf.keras.losses.CategoricalCrossentropy(
             from_logits=False,
-            label_smoothing=0.1,
+            label_smoothing=LABEL_SMOOTHING,
         )
         self.distillation_loss_fn = tf.keras.losses.KLDivergence()
 
@@ -430,7 +433,7 @@ class KDTrainingModel(models.Model):
         # Only evaluate the student model
         x, y = data
         student_predictions = self.student(x, training=False)
-        student_loss = self.student_loss_fn(y, student_predictions)
+        student_loss = self.eval_loss_fn(y, student_predictions)
         
         self.compiled_metrics.update_state(y, student_predictions)
         results = {m.name: m.result() for m in self.metrics}
@@ -460,15 +463,17 @@ def load_cifar10_3d(input_shape, num_classes, batch_size):
 
     # Simulate 3D data by repeating the 2D image along a new dimension (D)
     D = input_shape[0]
+    height, width, channels = input_shape[1], input_shape[2], input_shape[3]
 
     def augment_2d(image):
         image = tf.image.random_flip_left_right(image)
-        image = tf.image.resize_with_crop_or_pad(image, 36, 36)
-        image = tf.image.random_crop(image, size=(32, 32, 3))
+        image = tf.image.resize_with_crop_or_pad(image, height + 4, width + 4)
+        image = tf.image.random_crop(image, size=(height, width, channels))
         return image
 
     def to_3d(image, label):
         image_3d = tf.repeat(tf.expand_dims(image, axis=0), D, axis=0)
+        image_3d.set_shape((D, height, width, channels))
         return image_3d, label
 
     print(f"Original 2D shape: {x_train_2d.shape}")
@@ -512,7 +517,13 @@ def train_model():
     teacher_model = build_teacher_model(INPUT_SHAPE, NUM_CLASSES)
     
     # Build Student Model (The prunable 3D CNN)
-    student_model = build_model(INPUT_SHAPE, NUM_CLASSES, initial_filters=16)
+    student_model = build_model(
+        INPUT_SHAPE,
+        NUM_CLASSES,
+        initial_filters=16,
+        weight_decay=WEIGHT_DECAY,
+        dropout_rate=DROPOUT_RATE,
+    )
     
     # Setup Learning Rate Schedule and Optimizer
     total_steps = int(np.ceil(train_size / BATCH_SIZE) * EPOCHS)
