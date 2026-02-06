@@ -16,6 +16,9 @@ PRUNING_SCHEDULE = {
 }
 INITIAL_LR = 1e-3
 WARMUP_EPOCHS = 5
+WEIGHT_DECAY = 1e-4
+DROPOUT_RATE = 0.3
+LABEL_SMOOTHING = 0.1
 
 # --- Pruning Utility Layer ---
 
@@ -383,9 +386,8 @@ class KDTrainingModel(models.Model):
         super().compile(optimizer=optimizer, metrics=metrics, **kwargs)
         self.student_loss_fn = tf.keras.losses.CategoricalCrossentropy(
             from_logits=False,
-            label_smoothing=0.1,
+            label_smoothing=LABEL_SMOOTHING,
         )
-        self.eval_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
         self.distillation_loss_fn = tf.keras.losses.KLDivergence()
 
     @tf.function
@@ -513,7 +515,13 @@ def train_model():
     teacher_model = build_teacher_model(INPUT_SHAPE, NUM_CLASSES)
     
     # Build Student Model (The prunable 3D CNN)
-    student_model = build_model(INPUT_SHAPE, NUM_CLASSES, initial_filters=16)
+    student_model = build_model(
+        INPUT_SHAPE,
+        NUM_CLASSES,
+        initial_filters=16,
+        weight_decay=WEIGHT_DECAY,
+        dropout_rate=DROPOUT_RATE,
+    )
     
     # Setup Learning Rate Schedule and Optimizer
     total_steps = int(np.ceil(train_size / BATCH_SIZE) * EPOCHS)
